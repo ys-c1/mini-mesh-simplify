@@ -13,7 +13,9 @@ The simplifier is a quadratic error metric (QEM) edge-collapse
 implementation.  Vertices and faces are plain Python lists/tuples.
 """
 
+import heapq
 import math
+from itertools import count
 
 _EPS = 1e-12
 
@@ -172,35 +174,22 @@ def _mesh_centroid(verts):
     )
 
 
-def _triangle_area(a, b, c, center):
-    """Absolute 3D triangle area with an orientation-aware signed step.
-
-    The sign is used only as an internal consistency guard before taking
-    the absolute value.  For an outward-wound triangle the sign is
-    positive; reversing a triangle makes the signed value negative and
-    the surrounding ``abs`` restores the true geometric area.
-    """
+def _triangle_area(a, b, c):
+    """Absolute 3D triangle area: half the cross-product norm."""
     n = _cross(_sub(b, a), _sub(c, a))
-    magnitude = 0.5 * _length(n)
-    if magnitude <= _EPS:
-        return 0.0
-    face_center = (
-        (a[0] + b[0] + c[0]) / 3.0,
-        (a[1] + b[1] + c[1]) / 3.0,
-        (a[2] + b[2] + c[2]) / 3.0,
-    )
-    direction = _sub(face_center, center)
-    signed = magnitude if _dot(n, direction) >= 0.0 else -magnitude
-    return signed
+    return 0.5 * _length(n)
 
 
 def mesh_area(verts, faces):
-    """Return total triangle area as the sum of half cross-product norms."""
-    center = _mesh_centroid(verts)
+    """Return total triangle area as the sum of half cross-product norms.
+
+    Every triangle contributes its unsigned area, so winding direction
+    (including an occasional inward-facing triangle) never subtracts.
+    """
     total = 0.0
     for face in faces:
         a, b, c = (verts[face[0]], verts[face[1]], verts[face[2]])
-        total += _triangle_area(a, b, c, center)
+        total += _triangle_area(a, b, c)
     return total
 
 
@@ -232,15 +221,6 @@ def _boundary_vertices(faces):
             boundary.add(a)
             boundary.add(b)
     return boundary
-
-
-def _edge_counts(faces):
-    counts = {}
-    for face in faces:
-        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-            edge = (a, b) if a < b else (b, a)
-            counts[edge] = counts.get(edge, 0) + 1
-    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -327,16 +307,17 @@ def _best_collapse_point(qi, qj, pi, pj):
     return tuple(best_point), best_error
 
 
-def _candidate_edges(faces):
-    edge_faces = {}
-    for fi, face in enumerate(faces):
-        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-            edge = (a, b) if a < b else (b, a)
-            edge_faces.setdefault(edge, []).append(fi)
-    return edge_faces
+def _edge_key(a, b):
+    return (a, b) if a < b else (b, a)
 
 
-def _compact_mesh(verts, alive, faces):
+def _face_edges(face):
+    a, b, c = face
+    return (_edge_key(a, b), _edge_key(b, c), _edge_key(c, a))
+
+
+def _compact_mesh(verts, faces):
+    """Remap a working mesh onto dense indices with no dangling refs."""
     used = sorted({vi for face in faces for vi in face})
     remap = {old: new for new, old in enumerate(used)}
     out_verts = [
@@ -381,67 +362,170 @@ def _restore_area(verts, faces, area_before):
 def simplify(verts, faces, target_faces, lock_boundary=True):
     """Simplify a triangle mesh with QEM edge collapses.
 
-    Every iteration evaluates all current edges, removes the edge with
-    the smallest quadric error, remaps the faces to the surviving vertex,
-    and deletes degenerates.  When ``lock_boundary`` is true no edge
-    incident to a boundary vertex is considered.
+    A binary heap holds candidate edges ordered by smallest quadric
+    error; entries are validated lazily against the current mesh.  A
+    collapse deletes the one or two faces sharing the collapsed edge,
+    remaps every other reference from the dying vertex onto the
+    survivor, and refreshes the survivor's edge candidates.  When
+    ``lock_boundary`` is true no edge incident to a boundary vertex is
+    collapsed, so the boundary vertex set is preserved exactly.
     """
     verts = [(float(v[0]), float(v[1]), float(v[2])) for v in verts]
     faces = [tuple(int(i) for i in f) for f in faces]
     if not faces or target_faces >= len(faces):
         return list(verts), list(faces)
 
-    original_area = mesh_area(verts, faces)
     target_faces = max(0, int(target_faces))
-    alive = [True] * len(verts)
+    original_area = mesh_area(verts, faces)
+
+    nverts = len(verts)
+    alive = [True] * nverts
     positions = list(verts)
     quadrics = _all_vertex_quadrics(verts, faces)
 
-    while len(faces) > target_faces:
-        boundary = _boundary_vertices(faces)
-        edge_faces = _candidate_edges(faces)
-        best = None
+    # Mutable topology: face lists, per-vertex face sets, edge -> face sets.
+    face_list = [list(f) for f in faces]
+    vface = [set() for _ in range(nverts)]
+    edge_faces = {}
+    for fi, face in enumerate(face_list):
+        for vi in face:
+            vface[vi].add(fi)
+        for edge in _face_edges(face):
+            edge_faces.setdefault(edge, set()).add(fi)
+    face_count = len(face_list)
 
-        for edge in sorted(edge_faces):
-            i, j = edge
-            if not alive[i] or not alive[j]:
-                continue
-            incident = edge_faces[edge]
-            if len(incident) != 2:
-                # Closed-manifold edge or a boundary edge: collapsing it
-                # would create a hole in the current test meshes.
-                continue
-            if lock_boundary and (i in boundary or j in boundary):
-                continue
+    def remove_face(fi):
+        face = face_list[fi]
+        for edge in _face_edges(face):
+            users = edge_faces[edge]
+            users.discard(fi)
+            if not users:
+                del edge_faces[edge]
+        for vi in face:
+            vface[vi].discard(fi)
 
-            point, error = _best_collapse_point(
-                quadrics[i], quadrics[j], positions[i], positions[j]
+    def repoint_face(fi, old, new):
+        """Move one vertex of a live face; keep all index sets coherent."""
+        face = face_list[fi]
+        for edge in _face_edges(face):
+            users = edge_faces[edge]
+            users.discard(fi)
+            if not users:
+                del edge_faces[edge]
+        vface[old].discard(fi)
+        face[face.index(old)] = new
+        for edge in _face_edges(face):
+            edge_faces.setdefault(edge, set()).add(fi)
+        vface[new].add(fi)
+
+    def is_boundary_vertex(vi):
+        # Only edges actually incident to vi count: an interior vertex
+        # has neighbours whose faces touch the mesh boundary, but none
+        # of *its own* edges is a single-use boundary edge.
+        for fi in vface[vi]:
+            face = face_list[fi]
+            for edge in _face_edges(face):
+                if vi in edge and len(edge_faces[edge]) == 1:
+                    return True
+        return False
+
+    heap = []
+    serial = count()
+
+    def push_edge(u, v):
+        if not alive[u] or not alive[v]:
+            return
+        edge = _edge_key(u, v)
+        if edge not in edge_faces:
+            return
+        point, error = _best_collapse_point(
+            quadrics[u], quadrics[v], positions[u], positions[v]
+        )
+        heapq.heappush(heap, (error, next(serial), u, v, point))
+
+    for edge in edge_faces:
+        push_edge(edge[0], edge[1])
+
+    while face_count > target_faces and heap:
+        error, _, u, v, _ = heapq.heappop(heap)
+        if not alive[u] or not alive[v]:
+            continue
+        if _edge_key(u, v) not in edge_faces:
+            continue
+
+        # The cached error predates later collapses near this edge.
+        # Recompute against current quadrics and requeue the entry when
+        # the key drifted; otherwise the entry is current and wins.
+        # The tight scale-free tolerance lets exact planar (zero-error)
+        # edges pass while still catching genuinely stale keys.
+        fresh_point, fresh_error = _best_collapse_point(
+            quadrics[u], quadrics[v], positions[u], positions[v]
+        )
+        tolerance = 1e-14 * (1.0 + abs(error) + abs(fresh_error))
+        if abs(fresh_error - error) > tolerance:
+            heapq.heappush(
+                heap, (fresh_error, next(serial), u, v, fresh_point)
             )
-            if best is None or error > best[0] + 1e-15:
-                best = (error, edge, point)
+            continue
 
-        if best is None:
-            break
+        if lock_boundary and (is_boundary_vertex(u) or is_boundary_vertex(v)):
+            continue
 
-        _, (i, j), point = best
-        if i > j:
-            i, j = j, i
-
-        remaining = []
-        for face in faces:
-            if i in face and j in face:
+        shared = vface[u] & vface[v]
+        if len(shared) > 2:
+            # Non-manifold edge: collapsing it is not safe.
+            continue
+        if len(shared) == 2:
+            # Link condition: the two opposite vertices must not already
+            # share an edge, otherwise the collapse folds the surface.
+            thirds = []
+            for fi in shared:
+                face = face_list[fi]
+                thirds.append(next(k for k in face if k != u and k != v))
+            if thirds[0] == thirds[1] or _edge_key(thirds[0], thirds[1]) in edge_faces:
                 continue
-            if len(set(face)) == 3:
-                remaining.append(face)
-        faces = remaining
 
-        positions[i] = point
-        alive[j] = False
-        _add_quadric(quadrics[i], quadrics[j])
+        # Perform the collapse; u survives, v dies.  Every surviving face
+        # that referenced v is remapped onto u -- no stale indices remain.
+        for fi in sorted(shared):
+            remove_face(fi)
+            face_count -= 1
+        for fi in sorted(vface[v]):
+            repoint_face(fi, v, u)
 
-    return _finalize(positions, alive, faces, original_area)
+        # Two remapped faces could now coincide: drop exact duplicates so
+        # the result stays a set of distinct, manifold triangles.
+        seen = {}
+        duplicates = []
+        for fi in list(vface[u]):
+            key = tuple(sorted(face_list[fi]))
+            if key in seen:
+                duplicates.append(fi)
+            else:
+                seen[key] = fi
+        for fi in duplicates:
+            remove_face(fi)
+            face_count -= 1
+
+        alive[v] = False
+        positions[u] = fresh_point
+        _add_quadric(quadrics[u], quadrics[v])
+
+        neighbors = set()
+        for fi in vface[u]:
+            for k in face_list[fi]:
+                if k != u and alive[k]:
+                    neighbors.add(k)
+        for k in neighbors:
+            push_edge(u, k)
+
+    live_face_ids = sorted(
+        {fi for users in edge_faces.values() for fi in users}
+    )
+    out_faces = [tuple(face_list[fi]) for fi in live_face_ids]
+    return _finalize(positions, out_faces, original_area)
 
 
-def _finalize(verts, alive, faces, area_before):
-    result_verts, result_faces = _compact_mesh(verts, alive, faces)
+def _finalize(positions, faces, area_before):
+    result_verts, result_faces = _compact_mesh(positions, faces)
     return _restore_area(result_verts, result_faces, area_before)
